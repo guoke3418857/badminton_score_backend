@@ -41,6 +41,10 @@ async function migrate() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      -- 补充旧库中可能缺失的列
+      ALTER TABLE activities
+        ADD COLUMN IF NOT EXISTS force_ended BOOLEAN DEFAULT FALSE;
+
       CREATE TABLE IF NOT EXISTS signups (
         id TEXT PRIMARY KEY,
         activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
@@ -76,6 +80,7 @@ async function migrate() {
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        score_request_id TEXT REFERENCES score_requests(id) ON DELETE CASCADE,
         score INTEGER NOT NULL,
         reason TEXT CHECK (reason IN ('single_win','double_win','participation')) NOT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -85,6 +90,10 @@ async function migrate() {
       CREATE INDEX IF NOT EXISTS idx_activities_start_time ON activities(start_time);
       CREATE INDEX IF NOT EXISTS idx_score_requests_activity ON score_requests(activity_id);
       CREATE INDEX IF NOT EXISTS idx_score_logs_user ON score_logs(user_id);
+
+      -- 兼容老数据：如果缺少 score_request_id 列则补上
+      ALTER TABLE score_logs
+        ADD COLUMN IF NOT EXISTS score_request_id TEXT REFERENCES score_requests(id) ON DELETE CASCADE;
     `);
     await client.query("COMMIT");
   } catch (err) {
@@ -110,14 +119,17 @@ async function withTransaction(fn) {
   }
 }
 
-async function addScore(client, { userId, activityId, score, reason, incrementWin = false, incrementMatch = false }) {
+async function addScore(
+  client,
+  { userId, activityId, scoreRequestId = null, score, reason, incrementWin = false, incrementMatch = false }
+) {
   await client.query(
     `
-      INSERT INTO score_logs (id, user_id, activity_id, score, reason)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO score_logs (id, user_id, activity_id, score_request_id, score, reason)
+      VALUES ($1, $2, $3, $4, $5, $6)
       ON CONFLICT (user_id, activity_id, reason) DO NOTHING
     `,
-    [crypto.randomUUID(), userId, activityId, score, reason]
+    [crypto.randomUUID(), userId, activityId, scoreRequestId, score, reason]
   );
 
   await client.query(
@@ -138,7 +150,10 @@ function mapActivity(row) {
   const startMs = row.start_time ? Date.parse(row.start_time) : NaN;
   const endMs = row.end_time ? Date.parse(row.end_time) : NaN;
   let status = "upcoming";
-  if (!Number.isNaN(startMs) && now >= startMs) {
+  if (row.force_ended === true) {
+    // 管理员手动结束，优先级最高
+    status = "ended";
+  } else if (!Number.isNaN(startMs) && now >= startMs) {
     status = !Number.isNaN(endMs) && now > endMs ? "ended" : "ongoing";
   }
 

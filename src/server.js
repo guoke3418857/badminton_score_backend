@@ -338,6 +338,53 @@ app.get("/activities", async (_req, res) => {
   res.json(result.rows.map(mapActivity));
 });
 
+// 获取某个用户可发起积分申请的活动：
+// 1）该用户已报名该活动
+// 2）活动已结束
+// 3）该用户从未在该活动的任何积分申请中出现（无论是发起人、队友还是对手）
+app.get("/activities/eligible-for-score", async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId || typeof userId !== "string") {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const result = await pool.query(
+      `
+        SELECT a.*, COUNT(s_all.id) AS signup_count
+        FROM activities a
+        -- 该用户必须报名过该活动
+        JOIN signups s_user
+          ON s_user.activity_id = a.id
+         AND s_user.user_id = $1
+        -- 统计总报名人数
+        LEFT JOIN signups s_all
+          ON s_all.activity_id = a.id
+        -- 该用户在该活动中从未参与过任何积分申请（发起/队友/对手）
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM score_requests sr
+          WHERE sr.activity_id = a.id
+            AND (
+              sr.initiator_id = $1
+              OR sr.teammate_id = $1
+              OR sr.opponent_ids LIKE '%' || $1 || '%'
+            )
+        )
+        GROUP BY a.id
+        ORDER BY a.start_time DESC
+      `,
+      [userId]
+    );
+
+    // 只保留状态为 ended 的活动
+    const activities = result.rows.map(mapActivity).filter((a) => a.status === "ended");
+    res.json(activities);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get("/activities/:id", async (req, res) => {
   const row = await pool.query(
     `
@@ -500,6 +547,49 @@ app.post("/score-requests", async (req, res) => {
     const activity = await pool.query(`SELECT * FROM activities WHERE id = $1`, [data.activityId]);
     if (activity.rowCount === 0) return res.status(404).json({ error: "activity not found" });
 
+    // 活动级别限制：已经存在过积分申请（发起中 / 确认中 / 已完成）的活动，不能再次发起积分申请
+    const existingByActivity = await pool.query(
+      `
+        SELECT 1
+        FROM score_requests
+        WHERE activity_id = $1
+          AND status IN ('pending', 'confirming', 'finished')
+        LIMIT 1
+      `,
+      [data.activityId]
+    );
+    if (existingByActivity.rowCount > 0) {
+      return res.status(409).json({
+        error: "该活动已存在积分申请或已完成积分确认，不能再次发起积分申请",
+      });
+    }
+
+    // 校验：只有参加过该活动的人员之间才能发起积分申请
+    const signupRows = await pool.query(
+      `SELECT user_id FROM signups WHERE activity_id = $1`,
+      [data.activityId]
+    );
+    const participants = new Set(signupRows.rows.map((r) => r.user_id));
+
+    // 检查发起人是否参加过活动
+    if (!participants.has(data.initiatorId)) {
+      return res
+        .status(403)
+        .json({ error: "只有参加过该活动的人员才能发起积分申请" });
+    }
+
+    // 检查队友和对手是否都参加过活动
+    const relatedUserIds = [
+      ...(data.teammateId ? [data.teammateId] : []),
+      ...data.opponentIds,
+    ];
+    const notJoined = relatedUserIds.filter((uid) => !participants.has(uid));
+    if (notJoined.length > 0) {
+      return res.status(403).json({
+        error: "只有参加过该活动的人员之间才能相互发起积分申请",
+      });
+    }
+
     if (data.type === "single" && data.opponentIds.length !== 1) {
       return res.status(400).json({ error: "单打需要 1 名对手" });
     }
@@ -545,6 +635,78 @@ app.get("/score-requests", async (req, res) => {
     activityId,
   ]);
   res.json(rows.rows.map(formatScoreRequest));
+});
+
+app.get("/score-requests/pending", async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    
+    // 获取所有待确认或部分确认的积分申请
+    // 用户需要确认的条件：在 pending_confirmations 列表中
+    const rows = await pool.query(
+      `
+        SELECT * FROM score_requests
+        WHERE status IN ('pending', 'confirming')
+          AND pending_confirmations LIKE '%' || $1 || '%'
+        ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+    
+    // 过滤出真正包含该用户的待确认列表
+    const filtered = rows.rows.filter((row) => {
+      const pending = computePending(row.pending_confirmations);
+      return pending.includes(userId);
+    });
+
+    if (filtered.length === 0) {
+      return res.json([]);
+    }
+
+    // ------- 批量补充活动名称和用户姓名，用于前端展示 -------
+    const activityIds = Array.from(new Set(filtered.map((r) => r.activity_id)));
+    const allUserIdsSet = new Set();
+    for (const r of filtered) {
+      if (r.initiator_id) allUserIdsSet.add(r.initiator_id);
+      if (r.teammate_id) allUserIdsSet.add(r.teammate_id);
+      const opponents = computePending(r.opponent_ids);
+      for (const oid of opponents) {
+        if (oid) allUserIdsSet.add(oid);
+      }
+    }
+    const allUserIds = Array.from(allUserIdsSet);
+
+    const [activityRows, userRows] = await Promise.all([
+      pool.query(`SELECT id, title FROM activities WHERE id = ANY($1::text[])`, [activityIds]),
+      allUserIds.length > 0
+        ? pool.query(`SELECT id, name, department FROM users WHERE id = ANY($1::text[])`, [allUserIds])
+        : { rows: [] },
+    ]);
+
+    const activityMap = new Map(activityRows.rows.map((r) => [r.id, r]));
+    const userMap = new Map(userRows.rows.map((r) => [r.id, r]));
+
+    const enriched = filtered.map((row) => {
+      const base = formatScoreRequest(row);
+      const opponents = base.opponentIds || [];
+      return {
+        ...base,
+        activityTitle: activityMap.get(base.activityId)?.title || "",
+        initiatorName: userMap.get(base.initiatorId)?.name || base.initiatorId,
+        teammateName: base.teammateId ? userMap.get(base.teammateId)?.name || base.teammateId : undefined,
+        opponentsDetail: opponents.map((oid) => ({
+          id: oid,
+          name: userMap.get(oid)?.name || oid,
+          department: userMap.get(oid)?.department || "",
+        })),
+      };
+    });
+    
+    res.json(enriched);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.post("/score-requests/:id/confirm", async (req, res) => {
@@ -602,6 +764,7 @@ app.post("/score-requests/:id/confirm", async (req, res) => {
         await addScore(client, {
           userId: uid,
           activityId: sr.activity_id,
+          scoreRequestId: sr.id,
           score: 1,
           reason: "participation",
           incrementMatch: true,
@@ -612,6 +775,7 @@ app.post("/score-requests/:id/confirm", async (req, res) => {
         await addScore(client, {
           userId: sr.initiator_id,
           activityId: sr.activity_id,
+          scoreRequestId: sr.id,
           score: 5,
           reason: "single_win",
           incrementWin: true,
@@ -621,6 +785,7 @@ app.post("/score-requests/:id/confirm", async (req, res) => {
           await addScore(client, {
             userId: uid,
             activityId: sr.activity_id,
+            scoreRequestId: sr.id,
             score: 3,
             reason: "double_win",
             incrementWin: true,
@@ -637,6 +802,28 @@ app.post("/score-requests/:id/confirm", async (req, res) => {
   }
 });
 
+app.post("/score-requests/:id/reject", async (req, res) => {
+  try {
+    const { userId } = confirmSchema.parse(req.body);
+    const srResult = await pool.query(`SELECT * FROM score_requests WHERE id = $1`, [req.params.id]);
+    if (srResult.rowCount === 0) return res.status(404).json({ error: "not found" });
+    const sr = srResult.rows[0];
+    if (sr.status === "finished" || sr.status === "rejected") {
+      return res.status(409).json({ error: "已结束" });
+    }
+
+    const pending = computePending(sr.pending_confirmations);
+    if (!pending.includes(userId)) {
+      return res.status(403).json({ error: "无待确认权限" });
+    }
+
+    await pool.query(`UPDATE score_requests SET status='rejected', updated_at=NOW() WHERE id = $1`, [sr.id]);
+    res.json({ status: "rejected" });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get("/score-logs", async (req, res) => {
   const userId = req.query.userId;
   const limit = Number(req.query.limit ?? 50);
@@ -646,6 +833,84 @@ app.get("/score-logs", async (req, res) => {
     [userId, limit]
   );
   res.json(rows.rows.map(formatScoreLog));
+});
+
+// 积分记录详情（用于前端积分记录 item 跳转）
+app.get("/score-logs/:id", async (req, res) => {
+  try {
+    const logId = req.params.id;
+    const row = await pool.query(`SELECT * FROM score_logs WHERE id = $1`, [logId]);
+    if (row.rowCount === 0) {
+      return res.status(404).json({ error: "log not found" });
+    }
+    const log = row.rows[0];
+
+    // 补充活动和用户信息，便于前端展示
+    const [activityRows, userRows] = await Promise.all([
+      pool.query(`SELECT id, title FROM activities WHERE id = $1`, [log.activity_id]),
+      pool.query(`SELECT id, name, department FROM users WHERE id = $1`, [log.user_id]),
+    ]);
+
+    const activity = activityRows.rows[0] || null;
+    const user = userRows.rows[0] || null;
+
+    const base = {
+      ...formatScoreLog(log),
+      activityTitle: activity?.title ?? "",
+      userName: user?.name ?? "",
+      userDepartment: user?.department ?? "",
+    };
+
+    // 如果该积分来源于某条积分申请，附带该积分申请的完整信息（只读展示用）
+    if (!log.score_request_id) {
+      return res.json(base);
+    }
+
+    const srResult = await pool.query(`SELECT * FROM score_requests WHERE id = $1`, [
+      log.score_request_id,
+    ]);
+    if (srResult.rowCount === 0) {
+      return res.json(base);
+    }
+    const sr = srResult.rows[0];
+
+    const opponents = computePending(sr.opponent_ids);
+    const allUserIds = [
+      sr.initiator_id,
+      sr.teammate_id,
+      ...opponents,
+    ].filter(Boolean);
+
+    const usersForSr =
+      allUserIds.length > 0
+        ? await pool.query(
+            `SELECT id, name, department FROM users WHERE id = ANY($1::text[])`,
+            [allUserIds]
+          )
+        : { rows: [] };
+    const userMap = new Map(usersForSr.rows.map((r) => [r.id, r]));
+
+    const scoreRequest = {
+      ...formatScoreRequest(sr),
+      activityTitle: activity?.title ?? "",
+      initiatorName: userMap.get(sr.initiator_id)?.name || sr.initiator_id,
+      teammateName: sr.teammate_id
+        ? userMap.get(sr.teammate_id)?.name || sr.teammate_id
+        : undefined,
+      opponentsDetail: opponents.map((oid) => ({
+        id: oid,
+        name: userMap.get(oid)?.name || oid,
+        department: userMap.get(oid)?.department || "",
+      })),
+    };
+
+    res.json({
+      ...base,
+      scoreRequest,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.get("/users/:id/summary", async (req, res) => {
@@ -723,6 +988,53 @@ async function getUserRank(userId) {
   const found = result.rows.find((r) => r.id === userId);
   return found ? Number(found.rank) : null;
 }
+
+// 管理员手动将活动置为结束
+app.post("/activities/:id/end", async (req, res) => {
+  try {
+    const requester = req.headers["x-user-id"];
+    if (!requester || typeof requester !== "string") {
+      return res.status(401).json({ error: "missing x-user-id" });
+    }
+
+    const admin = await pool.query(`SELECT is_admin FROM users WHERE id = $1`, [requester]);
+    if (admin.rowCount === 0 || admin.rows[0].is_admin !== true) {
+      return res.status(403).json({ error: "forbidden: admin only" });
+    }
+
+    const activityId = req.params.id;
+    const result = await pool.query(
+      `
+        UPDATE activities
+        SET force_ended = TRUE,
+            end_time = COALESCE(end_time, NOW())
+        WHERE id = $1
+        RETURNING *
+      `,
+      [activityId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "activity not found" });
+    }
+
+    // 返回更新后的活动信息（包含当前报名人数）
+    const updated = await pool.query(
+      `
+        SELECT a.*, COUNT(s.id) AS signup_count
+        FROM activities a
+        LEFT JOIN signups s ON s.activity_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+      `,
+      [activityId]
+    );
+
+    res.json(mapActivity(updated.rows[0]));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
 
 // ---------- Bootstrapping ----------
 migrate()
