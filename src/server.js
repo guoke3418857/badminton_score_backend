@@ -89,6 +89,9 @@ const scoreRequestSchema = z.object({
   initiatorId: z.string().min(1),
   teammateId: z.string().optional(),
   opponentIds: z.array(z.string().min(1)).nonempty(),
+  // 单局比分（胜方与败方最终得分），用于按规则精细结算
+  winnerScore: z.number().int().min(0).max(30),
+  loserScore: z.number().int().min(0).max(30),
 });
 
 const confirmSchema = z.object({
@@ -166,6 +169,145 @@ async function ensureUser(id, extra = {}) {
 async function validateActivityExists(activityId) {
   const row = await pool.query(`SELECT id FROM activities WHERE id = $1`, [activityId]);
   return row.rowCount > 0;
+}
+
+// ---------- Scoring Engine ----------
+// 根据 PRD+积分规则说明页，实现统一的单打/双打个人积分结算：
+// - 单打基础分：胜 +10，负 +4
+// - 双打基础分（按人）：胜 +8，负 +5
+// - 比分差奖励：1–3 分 负方 +1；4–7 分 胜方 +1；>=8 分 胜方 +2
+// - 动态比分差上限：<50 → 上限 +2；50–99 → 上限 +1；>=100 → 上限 +0
+// - 分差保护：赛前积分差 >=100 时，高分一方胜利基础分 -2，低分一方失败基础分 +2
+// - 爆冷奖励（优先级高于比分差奖励）：
+//   - 完全爆冷：赛前积分差 >=100 且低分方获胜 → 低分方 +3
+//   - 接近爆冷：赛前积分差 >=100 且高分方获胜且比分差 <=3 → 低分方 +2
+
+function average(nums) {
+  if (!nums.length) return 0;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+/**
+ * 计算单场对局中每位选手的加减分及拆解明细
+ * @returns {{
+ *   points: Map<string, number>,
+ *   details: Map<string, {
+ *     role: "winner" | "loser",
+ *     base: number,
+ *     diffBonus: number,
+ *     upsetBonus: number,
+ *     protectionAdjust: number,
+ *     preScore: number,
+ *     sidePreAvg: { winner: number, loser: number },
+ *   }>
+ * }}
+ */
+function computeMatchPoints({ type, preScores, winnerIds, loserIds, winnerScore, loserScore }) {
+  const winnerSideScore = average(winnerIds.map((id) => preScores.get(id) ?? 0));
+  const loserSideScore = average(loserIds.map((id) => preScores.get(id) ?? 0));
+
+  const highSide = winnerSideScore >= loserSideScore ? "winner" : "loser";
+  const lowSide = highSide === "winner" ? "loser" : "winner";
+  const scoreGapPre = Math.abs(winnerSideScore - loserSideScore);
+
+  const baseWin = type === "single" ? 10 : 8;
+  const baseLose = type === "single" ? 4 : 5;
+
+  let finalBaseWin = baseWin;
+  let finalBaseLose = baseLose;
+  let protectionAdjustWin = 0;
+  let protectionAdjustLose = 0;
+
+  // 分差保护：赛前积分差 >= 100
+  if (scoreGapPre >= 100) {
+    if (highSide === "winner") {
+      // 高分方胜利：高分方 -2，低分方失败 +2
+      finalBaseWin = baseWin - 2;
+      finalBaseLose = baseLose + 2;
+      protectionAdjustWin = -2;
+      protectionAdjustLose = +2;
+    } else {
+      // 低分方胜利：高分方失败 -2，低分方胜利 +2
+      finalBaseWin = baseWin + 2;
+      finalBaseLose = baseLose - 2;
+      protectionAdjustWin = +2;
+      protectionAdjustLose = -2;
+    }
+  }
+
+  // 比分差奖励
+  const diff = Math.abs(winnerScore - loserScore);
+  let diffBonusWinner = 0;
+  let diffBonusLoser = 0;
+  if (diff >= 1) {
+    if (diff <= 3) {
+      diffBonusLoser = 1;
+    } else if (diff <= 7) {
+      diffBonusWinner = 1;
+    } else {
+      diffBonusWinner = 2;
+    }
+  }
+
+  // 动态比分差上限
+  if (scoreGapPre >= 100) {
+    diffBonusWinner = 0;
+    diffBonusLoser = 0;
+  } else if (scoreGapPre >= 50) {
+    diffBonusWinner = Math.min(diffBonusWinner, 1);
+    diffBonusLoser = Math.min(diffBonusLoser, 1);
+  }
+
+  // 爆冷奖励（覆盖比分差奖励）
+  let upsetBonusWinner = 0;
+  let upsetBonusLoser = 0;
+  if (scoreGapPre >= 100) {
+    const lowSideIsWinner = lowSide === "winner";
+    if (lowSideIsWinner) {
+      // 完全爆冷：低分方获胜
+      upsetBonusWinner = 3;
+      diffBonusWinner = 0;
+      diffBonusLoser = 0;
+    } else if (diff <= 3) {
+      // 接近爆冷：高分方胜利但小分差
+      upsetBonusLoser = 2;
+      diffBonusWinner = 0;
+      diffBonusLoser = 0;
+    }
+  }
+
+  const totalWinnerSide = finalBaseWin + diffBonusWinner + upsetBonusWinner;
+  const totalLoserSide = finalBaseLose + diffBonusLoser + upsetBonusLoser;
+
+  const points = new Map();
+  const details = new Map();
+
+  winnerIds.forEach((id) => {
+    points.set(id, totalWinnerSide);
+    details.set(id, {
+      role: "winner",
+      base: finalBaseWin,
+      diffBonus: diffBonusWinner,
+      upsetBonus: upsetBonusWinner,
+      protectionAdjust: protectionAdjustWin,
+      preScore: preScores.get(id) ?? 0,
+      sidePreAvg: { winner: winnerSideScore, loser: loserSideScore },
+    });
+  });
+  loserIds.forEach((id) => {
+    points.set(id, totalLoserSide);
+    details.set(id, {
+      role: "loser",
+      base: finalBaseLose,
+      diffBonus: diffBonusLoser,
+      upsetBonus: upsetBonusLoser,
+      protectionAdjust: protectionAdjustLose,
+      preScore: preScores.get(id) ?? 0,
+      sidePreAvg: { winner: winnerSideScore, loser: loserSideScore },
+    });
+  });
+
+  return { points, details };
 }
 
 // ---------- Routes ----------
@@ -547,23 +689,6 @@ app.post("/score-requests", async (req, res) => {
     const activity = await pool.query(`SELECT * FROM activities WHERE id = $1`, [data.activityId]);
     if (activity.rowCount === 0) return res.status(404).json({ error: "activity not found" });
 
-    // 活动级别限制：已经存在过积分申请（发起中 / 确认中 / 已完成）的活动，不能再次发起积分申请
-    const existingByActivity = await pool.query(
-      `
-        SELECT 1
-        FROM score_requests
-        WHERE activity_id = $1
-          AND status IN ('pending', 'confirming', 'finished')
-        LIMIT 1
-      `,
-      [data.activityId]
-    );
-    if (existingByActivity.rowCount > 0) {
-      return res.status(409).json({
-        error: "该活动已存在积分申请或已完成积分确认，不能再次发起积分申请",
-      });
-    }
-
     // 校验：只有参加过该活动的人员之间才能发起积分申请
     const signupRows = await pool.query(
       `SELECT user_id FROM signups WHERE activity_id = $1`,
@@ -598,6 +723,7 @@ app.post("/score-requests", async (req, res) => {
       if (data.opponentIds.length !== 2) return res.status(400).json({ error: "双打需要 2 名对手" });
     }
 
+    // 限制：同一用户在同一活动中，每种类型（单打/双打）仅能各发起一次
     const dup = await pool.query(
       `SELECT 1 FROM score_requests WHERE activity_id = $1 AND initiator_id = $2 AND type = $3`,
       [data.activityId, data.initiatorId, data.type]
@@ -616,10 +742,20 @@ app.post("/score-requests", async (req, res) => {
     await pool.query(
       `
         INSERT INTO score_requests
-          (id, activity_id, type, initiator_id, teammate_id, opponent_ids, status, pending_confirmations, confirmed_by)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, '')
+          (id, activity_id, type, initiator_id, teammate_id, opponent_ids, winner_score, loser_score, status, pending_confirmations, confirmed_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, '')
       `,
-      [id, data.activityId, data.type, data.initiatorId, data.teammateId ?? null, data.opponentIds.join(","), pending.join(",")]
+      [
+        id,
+        data.activityId,
+        data.type,
+        data.initiatorId,
+        data.teammateId ?? null,
+        data.opponentIds.join(","),
+        data.winnerScore,
+        data.loserScore,
+        pending.join(","),
+      ]
     );
     res.status(201).json({ id, status: "pending" });
   } catch (err) {
@@ -759,38 +895,85 @@ app.post("/score-requests/:id/confirm", async (req, res) => {
       if (sr.type === "double" && sr.teammate_id) {
         participantIds.add(sr.teammate_id);
       }
+      const allIds = Array.from(participantIds);
 
-      for (const uid of participantIds) {
-        await addScore(client, {
-          userId: uid,
-          activityId: sr.activity_id,
-          scoreRequestId: sr.id,
-          score: 1,
-          reason: "participation",
-          incrementMatch: true,
-        });
-      }
-
-      if (sr.type === "single") {
-        await addScore(client, {
-          userId: sr.initiator_id,
-          activityId: sr.activity_id,
-          scoreRequestId: sr.id,
-          score: 5,
-          reason: "single_win",
-          incrementWin: true,
-        });
-      } else if (sr.teammate_id) {
-        for (const uid of [sr.initiator_id, sr.teammate_id]) {
+      // 如果旧数据中没有比分，则回退到原有的简单积分规则（兼容历史记录）
+      if (sr.winner_score == null || sr.loser_score == null) {
+        for (const uid of participantIds) {
           await addScore(client, {
             userId: uid,
             activityId: sr.activity_id,
             scoreRequestId: sr.id,
-            score: 3,
-            reason: "double_win",
-            incrementWin: true,
+            score: 1,
+            reason: "participation",
+            incrementMatch: true,
           });
         }
+
+        if (sr.type === "single") {
+          await addScore(client, {
+            userId: sr.initiator_id,
+            activityId: sr.activity_id,
+            scoreRequestId: sr.id,
+            score: 5,
+            reason: "single_win",
+            incrementWin: true,
+          });
+        } else if (sr.teammate_id) {
+          for (const uid of [sr.initiator_id, sr.teammate_id]) {
+            await addScore(client, {
+              userId: uid,
+              activityId: sr.activity_id,
+              scoreRequestId: sr.id,
+              score: 3,
+              reason: "double_win",
+              incrementWin: true,
+            });
+          }
+        }
+
+        return { status: "finished" };
+      }
+
+      // 新规则：基于赛前积分、单双打类型与比分进行精细结算
+      const usersResult = await client.query(
+        `SELECT id, total_score FROM users WHERE id = ANY($1::text[])`,
+        [allIds]
+      );
+      const preScores = new Map(usersResult.rows.map((row) => [row.id, row.total_score ?? 0]));
+
+      const winnerIds =
+        sr.type === "single"
+          ? [sr.initiator_id]
+          : sr.teammate_id
+          ? [sr.initiator_id, sr.teammate_id]
+          : [sr.initiator_id];
+
+      const loserIds = opponentIds;
+
+      const { points, details } = computeMatchPoints({
+        type: sr.type,
+        preScores,
+        winnerIds,
+        loserIds,
+        winnerScore: sr.winner_score,
+        loserScore: sr.loser_score,
+      });
+
+      for (const uid of allIds) {
+        const delta = points.get(uid) ?? 0;
+        const isWinner = winnerIds.includes(uid);
+        const detail = details.get(uid) ?? null;
+        await addScore(client, {
+          userId: uid,
+          activityId: sr.activity_id,
+          scoreRequestId: sr.id,
+          score: delta,
+          reason: "match_score",
+          incrementWin: isWinner,
+          incrementMatch: true,
+          detail,
+        });
       }
 
       return { status: "finished" };
@@ -959,6 +1142,8 @@ function formatScoreRequest(row) {
     initiatorId: row.initiator_id,
     teammateId: row.teammate_id || undefined,
     opponentIds: computePending(row.opponent_ids),
+    winnerScore: row.winner_score ?? undefined,
+    loserScore: row.loser_score ?? undefined,
     status: row.status,
     createdAt: row.created_at,
     pendingConfirmations: computePending(row.pending_confirmations),
@@ -974,6 +1159,7 @@ function formatScoreLog(row) {
     score: row.score,
     reason: row.reason,
     createdAt: row.created_at,
+    detail: row.detail || null,
   };
 }
 

@@ -76,13 +76,22 @@ async function migrate() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      -- 兼容旧库的 score_requests 表：补充比分相关列
+      ALTER TABLE score_requests
+        ADD COLUMN IF NOT EXISTS winner_score INTEGER;
+      ALTER TABLE score_requests
+        ADD COLUMN IF NOT EXISTS loser_score INTEGER;
+
       CREATE TABLE IF NOT EXISTS score_logs (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
         score_request_id TEXT REFERENCES score_requests(id) ON DELETE CASCADE,
         score INTEGER NOT NULL,
-        reason TEXT CHECK (reason IN ('single_win','double_win','participation')) NOT NULL,
+        -- reason 保留旧值以兼容历史数据，同时新增 match_score 作为“整场对局结算结果”
+        reason TEXT NOT NULL,
+        -- 额外说明信息（JSON），用于前端展示积分拆解（基础分/比分差/爆冷/保护等）
+        detail JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(user_id, activity_id, reason)
       );
@@ -94,6 +103,28 @@ async function migrate() {
       -- 兼容老数据：如果缺少 score_request_id 列则补上
       ALTER TABLE score_logs
         ADD COLUMN IF NOT EXISTS score_request_id TEXT REFERENCES score_requests(id) ON DELETE CASCADE;
+
+      -- 兼容老库：如果缺少 detail 列则补上（用于存储积分拆解说明）
+      ALTER TABLE score_logs
+        ADD COLUMN IF NOT EXISTS detail JSONB;
+
+      -- 兼容老库中 score_logs.reason 的 CHECK 约束，扩展允许的取值
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints
+          WHERE table_name = 'score_logs'
+            AND constraint_type = 'CHECK'
+            AND constraint_name = 'score_logs_reason_check'
+        ) THEN
+          ALTER TABLE score_logs DROP CONSTRAINT score_logs_reason_check;
+        END IF;
+      END$$;
+
+      ALTER TABLE score_logs
+        ADD CONSTRAINT score_logs_reason_check
+        CHECK (reason IN ('single_win','double_win','participation','match_score'));
     `);
     await client.query("COMMIT");
   } catch (err) {
@@ -121,15 +152,24 @@ async function withTransaction(fn) {
 
 async function addScore(
   client,
-  { userId, activityId, scoreRequestId = null, score, reason, incrementWin = false, incrementMatch = false }
+  {
+    userId,
+    activityId,
+    scoreRequestId = null,
+    score,
+    reason,
+    incrementWin = false,
+    incrementMatch = false,
+    detail = null,
+  }
 ) {
   await client.query(
     `
-      INSERT INTO score_logs (id, user_id, activity_id, score_request_id, score, reason)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO score_logs (id, user_id, activity_id, score_request_id, score, reason, detail)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       ON CONFLICT (user_id, activity_id, reason) DO NOTHING
     `,
-    [crypto.randomUUID(), userId, activityId, scoreRequestId, score, reason]
+    [crypto.randomUUID(), userId, activityId, scoreRequestId, score, reason, detail]
   );
 
   await client.query(
