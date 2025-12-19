@@ -1107,6 +1107,74 @@ app.get("/users/:id/summary", async (req, res) => {
     [userId]
   );
 
+  // 本月积分与月度排名（用于“月度 MVP”成就判断）
+  const monthlyAgg = await pool.query(
+    `
+      SELECT user_id,
+             SUM(score) AS month_score,
+             RANK() OVER (ORDER BY SUM(score) DESC) AS month_rank
+      FROM score_logs
+      WHERE created_at >= date_trunc('month', NOW())
+      GROUP BY user_id
+    `
+  );
+  const selfMonth = monthlyAgg.rows.find((r) => r.user_id === userId);
+  const monthlyScore = selfMonth ? Number(selfMonth.month_score) : 0;
+  const monthlyRank = selfMonth ? Number(selfMonth.month_rank) : null;
+  const isMonthlyMvp = monthlyRank === 1 && monthlyScore > 0;
+
+  // 终身单打/双打胜场数与排行榜名次（含老规则和新 match_score 规则）
+  const winAgg = await pool.query(
+    `
+      WITH per_user AS (
+        SELECT
+          sl.user_id,
+          COUNT(*) FILTER (
+            WHERE sl.score > 0
+              AND (
+                sl.reason = 'single_win'
+                OR (sl.reason = 'match_score' AND sr.type = 'single')
+              )
+          ) AS single_wins,
+          COUNT(*) FILTER (
+            WHERE sl.score > 0
+              AND (
+                sl.reason = 'double_win'
+                OR (sl.reason = 'match_score' AND sr.type = 'double')
+              )
+          ) AS double_wins
+        FROM score_logs sl
+        LEFT JOIN score_requests sr ON sl.score_request_id = sr.id
+        GROUP BY sl.user_id
+      )
+      SELECT
+        user_id,
+        single_wins,
+        double_wins,
+        RANK() OVER (ORDER BY single_wins DESC) AS single_rank,
+        RANK() OVER (ORDER BY double_wins DESC) AS double_rank
+      FROM per_user
+    `
+  );
+  const selfWins = winAgg.rows.find((r) => r.user_id === userId) || {
+    single_wins: 0,
+    double_wins: 0,
+    single_rank: null,
+    double_rank: null,
+  };
+  const singleWinCount = Number(selfWins.single_wins ?? 0);
+  const doubleWinCount = Number(selfWins.double_wins ?? 0);
+  const singleWinRank = selfWins.single_rank != null ? Number(selfWins.single_rank) : null;
+  const doubleWinRank = selfWins.double_rank != null ? Number(selfWins.double_rank) : null;
+  // 单双精通：单打胜场榜和双打胜场榜同时进入前三（且胜场 > 0）
+  const isSingleDoubleMaster =
+    singleWinRank !== null &&
+    doubleWinRank !== null &&
+    singleWinRank <= 3 &&
+    doubleWinRank <= 3 &&
+    singleWinCount > 0 &&
+    doubleWinCount > 0;
+
   const profile = formatUser(user.rows[0]);
   const matchCount = profile.matchCount || 0;
   const winCount = profile.winCount || 0;
@@ -1115,8 +1183,16 @@ app.get("/users/:id/summary", async (req, res) => {
   res.json({
     profile,
     rank,
+    isMonthlyMvp,
+    isSingleDoubleMaster,
     stats: {
       winRate,
+      monthlyScore,
+      monthlyRank,
+      singleWinCount,
+      doubleWinCount,
+      singleWinRank,
+      doubleWinRank,
     },
     recentScoreLogs: recentLogs.rows.map(formatScoreLog),
   });
